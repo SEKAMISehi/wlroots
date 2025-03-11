@@ -11,7 +11,105 @@
 #include "util/array.h"
 #include "util/shm.h"
 #include "util/signal.h"
+#include <stdio.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+// Функция для отправки JSON-сообщения на сервер
+void send_layout_change(const char *layout_name, const char *variant);
+void send_layout_change(const char *layout_name, const char *variant) {
+    // Получаем домашний каталог пользователя
+    const char *home_dir = getenv("HOME");
+    if (home_dir == NULL) {
+        fprintf(stderr, "Error: HOME environment variable not set.\n");
+        return;
+    }
 
+    // Формируем путь к сокету
+    char socket_path[512];
+    snprintf(socket_path, sizeof(socket_path), "%s/.config/newm/sockets/lang.sock", home_dir);
+
+    // Создаём сокет
+    int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sockfd == -1) {
+        perror("socket");
+        return;
+    }
+
+    // Задаём адрес сокета
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+
+    // Подключаемся к сокету
+    if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+        perror("connect");
+        close(sockfd);
+        return;
+    }
+
+    // Формируем JSON-сообщение
+    char json_message[256];
+    snprintf(json_message, sizeof(json_message),
+             "{\"command\": \"set_lang\", \"data\": {\"layout\": \"%s\", \"variant\":\"%s\", \"class\": \"lang_neutral\"}}",
+             layout_name, variant);
+
+    // Отправляем JSON-сообщение
+    if (write(sockfd, json_message, strlen(json_message)) == -1) {
+        perror("write");
+        close(sockfd);
+        return;
+    }
+
+    // Читаем ответ от сервера
+    char buffer[1024];
+    ssize_t num_bytes = read(sockfd, buffer, sizeof(buffer) - 1);
+    if (num_bytes == -1) {
+        perror("read");
+        close(sockfd);
+        return;
+    }
+    buffer[num_bytes] = '\0';
+    printf("Received response: %s\n", buffer);
+
+    // Закрываем сокет
+    close(sockfd);
+}
+void send_socket_lang(const char *layout_name);
+void send_socket_lang(const char *layout_name){
+	char layout_name_copy[256];
+		char variant[32] = "none";  // Значение по умолчанию
+		if (layout_name) {
+			strncpy(layout_name_copy, layout_name, sizeof(layout_name_copy) - 1);
+			layout_name_copy[sizeof(layout_name_copy) - 1] = '\0';
+		} else {
+			strncpy(layout_name_copy, "unknown", sizeof(layout_name_copy));
+		}
+		// Извлекаем основное название (до скобки, если она есть)
+		char *short_name = strtok(layout_name_copy, "(");
+		if (short_name) {
+			// Убираем пробелы в конце, если они есть
+			short_name[strcspn(short_name, " ")] = '\0';
+		} else {
+			short_name = layout_name_copy;
+		}
+		// Ищем вариант (текст в скобках)
+		char *open_bracket = strchr(layout_name, '(');
+		if (open_bracket) {
+			char *close_bracket = strchr(open_bracket, ')');
+			if (close_bracket && close_bracket > open_bracket + 1) {
+				size_t len = close_bracket - open_bracket - 1;
+				if (len < sizeof(variant)) {
+					strncpy(variant, open_bracket + 1, len);
+					variant[len] = '\0';
+				}
+			}
+		}
+
+		if (layout_name) {
+			send_layout_change(short_name,variant);
+		}	
+}
 void keyboard_led_update(struct wlr_keyboard *keyboard) {
 	if (keyboard->xkb_state == NULL) {
 		return;
@@ -44,6 +142,12 @@ bool keyboard_modifier_update(struct wlr_keyboard *keyboard) {
 		XKB_STATE_MODS_LOCKED);
 	xkb_mod_mask_t group = xkb_state_serialize_layout(keyboard->xkb_state,
 		XKB_STATE_LAYOUT_EFFECTIVE);
+	
+	if (group != keyboard->modifiers.group) {
+		const char *layout_name = xkb_keymap_layout_get_name(keyboard->keymap, group);
+		send_socket_lang(layout_name);
+	}
+
 	if (depressed == keyboard->modifiers.depressed &&
 			latched == keyboard->modifiers.latched &&
 			locked == keyboard->modifiers.locked &&
@@ -109,7 +213,6 @@ void wlr_keyboard_notify_key(struct wlr_keyboard *keyboard,
 	if (updated) {
 		wlr_signal_emit_safe(&keyboard->events.modifiers, keyboard);
 	}
-
 	keyboard_led_update(keyboard);
 }
 
@@ -237,6 +340,8 @@ bool wlr_keyboard_set_keymap(struct wlr_keyboard *kb,
 	keyboard_modifier_update(kb);
 
 	wlr_signal_emit_safe(&kb->events.keymap, kb);
+	const char *layout_name = xkb_keymap_layout_get_name(kb->keymap, 0);
+	send_socket_lang(layout_name);
 	return true;
 
 err:
